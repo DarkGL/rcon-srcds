@@ -34,6 +34,13 @@ class SourceRCON {
          */
         this.port = options.port || 27015;
 
+         /**
+         * Local address
+         * @type {string}
+         * @default 0.0.0.0
+         */
+        this.localAddress = options.localAddress || '0.0.0.0';
+
         /**
          * Maximum packet bytes size, zero to unlimit
          * @type {number}
@@ -61,7 +68,8 @@ class SourceRCON {
          */
         this.connection = createConnection({
             host: this.host,
-            port: this.port
+            port: this.port,
+            localAddress: this.localAddress,
         });
 
         this.connection.setTimeout(this.timeout); 
