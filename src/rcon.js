@@ -74,6 +74,9 @@ class SourceRCON {
 
         this.connection.setTimeout(this.timeout); 
 
+        this.connection.on('data', this.onData.bind( this ));
+        this.connection.once('error', this.onError.bind( this ));
+
         /**
          * Whether server has been authenticated
          * @type {boolean}
@@ -82,12 +85,48 @@ class SourceRCON {
          */
         this.authenticated = false;
 
-        /**
-         * Queue to sequence the requests to server
-         * @type {Object}
-         * @private
-         */
-        this.q = new queue({ "autostart": true, "timeout": 500, "concurrency": 1 });
+        this.packetResponseCallback = {};
+
+        this.responseAck = {};
+
+        this.responseExecute = {};
+
+        this.authRequest = 0;
+    }
+
+    onData( packet ) {
+        const decodedPacket = Packet.decode(packet, this.encoding);
+
+        if( decodedPacket.type === Protocol.SERVERDATA_RESPONSE_VALUE ){
+            if( this.responseAck[ decodedPacket.id ] && decodedPacket.body === '\x00\x01\x00\x00' ){
+                this.packetResponseCallback[ this.responseAck[ decodedPacket.id ].id ]( this.responseExecute[ this.responseAck[ decodedPacket.id ].id ] );
+
+                delete this.responseAck[ decodedPacket.id ];
+                delete this.packetResponseCallback[ this.responseAck[ decodedPacket.id ] ];
+                delete this.responseExecute[ decodedPacket.id ];
+            }
+            else if( this.responseAck[ decodedPacket.id ] ){
+                this.responseExecute[ decodedPacket.id ] = this.responseExecute[ decodedPacket.id ].concat(decodedPacket.body.replace(/\n$/, '\n'));
+            }
+        }
+        else if( decodedPacket.type === Protocol.SERVERDATA_AUTH_RESPONSE){
+            if( decodedPacket.id === -1 ){
+
+                this.packetResponseCallback[ this.authRequest ]( false );
+
+                this.authRequest = 0;
+
+                return;
+            }
+
+            this.packetResponseCallback[ this.authRequest ]( true );
+
+            this.authRequest = 0;
+        }
+    }
+
+    onError() {
+
     }
 
     /**
@@ -103,15 +142,18 @@ class SourceRCON {
             // Send a authentication packet (0x02)
             this.write(Protocol.SERVERDATA_AUTH, Protocol.ID_AUTH, password)
                 .then((data) => {
-                    if (data === 'success') { // Request ID !== -1 mean success!
+                    if (data) {
                         this.authenticated = true;
                         resolve();
                     } else {
-                        this.disconnect(); // Failed, disconnect from server :(
+                        this.disconnect();
+
                         reject(Error('Unable to authenticate'));
                     }
                 })
-                .catch(reject); // Error from this.write
+                .catch(reject);
+
+            setTimeout( reject, 5000 );
         });
     }
 
@@ -147,48 +189,41 @@ class SourceRCON {
      * @returns {Promise<DecodedPacket>}
      */
     write (type, id, body) {
+        this.packetResponseCallback[ id ] = {};
+
+        const packetIDAck = this.generatePacketID();
+
+        if( type === Protocol.SERVERDATA_AUTH ){
+            this.authRequest = id;
+        }
+        else{
+            this.responseAck[ packetIDAck ] = {};
+
+            this.responseAck[ packetIDAck ].id = id;
+            this.responseAck[ packetIDAck ].type = type;
+
+            this.responseExecute[ id ] = '';
+        }
+
         return new Promise((resolve, reject) => {
-            let response = '';
-            const onData = packet => {
-                const decodedPacket = Packet.decode(packet, this.encoding);
-
-                // Because server will response twice(0x00 and 0x02) if we send authenticate packet(0x03)
-                // but we need 0x02 for confirm
-                if (type === Protocol.SERVERDATA_AUTH && decodedPacket.type !== Protocol.SERVERDATA_AUTH_RESPONSE) {
-                    return;
-                } else if (type === Protocol.SERVERDATA_AUTH && decodedPacket.type === Protocol.SERVERDATA_AUTH_RESPONSE) {
-                    if (decodedPacket.id === Protocol.ID_AUTH) { // Request ID !== -1 mean success!
-                        resolve('success');
-                    } else {
-                        resolve('failed');
-                    }
-                    this.connection.removeListener('data', onData); // GC
-                } else if(id == decodedPacket.id) {;
-                    response = response.concat(decodedPacket.body.replace(/\n$/, '\n')); // Last new line must be gooone 
-                    // since response can have multiple packets, we have to keep listening until
-                    // the original reaquest is present at the end of the response. This makes sure
-                    // all data has been received.
-                    if(response.includes(`command "${body}"`)) {
-                        this.connection.removeListener('data', onData); // GC
-                        resolve(response); // Let's return our decoded packet data!
-                    }
-                }
-                this.connection.removeListener('error', onError); // GC
-            }
-
-            const onError = e => {
-                this.connection.removeListener('data', onData); // GC
-                reject(e);
+            this.packetResponseCallback[ id ] = ( decodedPacket ) => {
+                resolve( decodedPacket );
             }
 
             const encodedPacket = Packet.encode(type, id, body, this.encoding);
-            // Check packet size with option.maximumPacketSize
-            if (this.maximumPacketSize > 0 && encodedPacket.length > this.maximumPacketSize)
-                reject(Error('Packet too long'));
 
-            this.connection.on('data', onData); // This event can emit multiple time (i.g. Authentication, Multiple-Packet Responses)
-            this.connection.once('error', onError);
+            if (this.maximumPacketSize > 0 && encodedPacket.length > this.maximumPacketSize){
+                reject(Error('Packet too long'));
+            }
+
+
             this.connection.write(encodedPacket);
+
+            if( type === Protocol.SERVERDATA_AUTH ){
+                const encodedPacketAck = Packet.encode(Protocol.SERVERDATA_RESPONSE_VALUE, packetIDAck, '', this.encoding);
+                
+                this.connection.write(encodedPacketAck);
+            }
         });
     }
 
@@ -199,20 +234,34 @@ class SourceRCON {
      */
     execute (command) {
         return new Promise((resolve, reject) => {
-            let packetID = Math.floor(Math.random() * (256 - 1) + 1);
+            const packetID = this.generatePacketID();
+
+            if( !packetID ){
+                return reject(Error(`Couldn't generate unique id`));
+            }
+
             if (!this.connection.writable)
                 reject(Error('Unable to write to socket'));
 
             if (!this.authenticated)
                 reject(Error('Unable to authenticate'));
 
-            // Enqueue requests, else answers may get lost.
-            this.q.push(() => {
-                this.write(Protocol.SERVERDATA_EXECCOMMAND, packetID, command, this.encoding)
-                    .then(data => resolve(data))
-                    .catch(reject);
-            });
+            this.write(Protocol.SERVERDATA_EXECCOMMAND, packetID, command, this.encoding)
+                .then(data => resolve(data))
+                .catch(reject);
         });
+    }
+
+    generatePacketID(){
+        for( let currentPacketId = 1;currentPacketId <= 256; currentPacketId++ ){
+            if( this.responseAck[ currentPacketId ] ){
+                continue;
+            }
+
+            return currentPacketId;
+        }
+
+        return 0;
     }
 }
 
