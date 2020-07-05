@@ -72,7 +72,7 @@ class SourceRCON {
             localAddress: this.localAddress,
         });
 
-        this.connection.setTimeout(this.timeout); 
+        this.connection.setTimeout(this.timeout);
 
         this.connection.on('data', this.onData.bind( this ));
         this.connection.once('error', this.onError.bind( this ));
