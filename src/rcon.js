@@ -216,10 +216,9 @@ class SourceRCON {
                 reject(Error('Packet too long'));
             }
 
-
             this.connection.write(encodedPacket);
 
-            if( type === Protocol.SERVERDATA_AUTH ){
+            if( type !== Protocol.SERVERDATA_AUTH ){
                 const encodedPacketAck = Packet.encode(Protocol.SERVERDATA_RESPONSE_VALUE, packetIDAck, '', this.encoding);
                 
                 this.connection.write(encodedPacketAck);
